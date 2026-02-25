@@ -1,0 +1,866 @@
+//************************//
+// Alapadatok
+//************************//
+
+// Azonosítók központi kezelése
+function getSpreadsheetIds() {
+  return {
+    sourceSpreadsheetId: "1Kx-zJiOBL_g6Dp4ddjdQVgHy2H8J_Wv6zjqd2LbSIlY",
+    targetSpreadsheetId: "1D3GOz8kbL4IOloHuW3jo2ALVmp9stNNX3lbOTmpOr6k"
+  };
+}
+
+// Jutalék típusának kezelése: "fixed" vagy "percentage"
+function getCommissionType() {
+  return "percentage"; // "fixed" = fix összeg pl.: 10 000 Ft | "percentage" = % pl.: 10%
+}
+
+// Jutalék összegének központi kezelése (fix összeg)
+function getCommissionAmount() {
+  return 10000;
+}
+
+// Jutalék százalékának központi kezelése
+function getCommissionRate() {
+  return 15;
+}
+
+// Chunk méretének központi kezelése
+function getChunkSize() {
+  return 1000;
+}
+
+//************************//
+// Egyszerre fusson minden függvény
+//************************//
+
+function runAll() {
+  syncSuccessfulOrders();
+  syncExpiredSubscriptions();
+  syncCanceledSubscriptions();
+  syncFailedOrders();
+  syncProductsToUpsell();
+}
+
+// Dátum formázása
+function getFormattedDate() {
+  var today = new Date();
+  return today.getFullYear() + "-" +
+    String(today.getMonth() + 1).padStart(2, '0') + "-" +
+    String(today.getDate()).padStart(2, '0');
+}
+
+// Munkalap keresése előtag alapján
+function getSheetByPrefix(spreadsheet, prefix) {
+  var sheets = spreadsheet.getSheets();
+  var sheet = sheets.find(s => s.getName().startsWith(prefix));
+  Logger.log(sheet ? "Talált munkalap: " + sheet.getName() : "Nem található munkalap: " + prefix);
+  return sheet || null;
+}
+
+// JAVÍTVA: csak egy definíció, NEM törli az adatokat – csak létrehozza ha nem létezik
+function ensureSheetExists(spreadsheet, sheetName) {
+  var sheet = spreadsheet.getSheetByName(sheetName);
+  if (!sheet) {
+    Logger.log("Létrehozás alatt: " + sheetName);
+    sheet = spreadsheet.insertSheet(sheetName);
+  } else {
+    Logger.log("Munkalap már létezik: " + sheetName);
+  }
+  return sheet;
+}
+
+// Új sorok beszúrása a fejléc UTÁNi első sorba (legújabb elöl)
+function prependNewData(newRows, sheet, columnCount) {
+  if (newRows.length === 0) {
+    Logger.log("Nincs új adat hozzáadásra.");
+    return;
+  }
+
+  var lastRow = sheet.getLastRow();
+  var combined;
+
+  if (lastRow <= 1) {
+    combined = newRows;
+  } else {
+    var existingRows = sheet.getRange(2, 1, lastRow - 1, columnCount).getValues();
+    combined = newRows.concat(existingRows);
+  }
+
+  // Dátum szerinti rendezés – legfrissebb elöl (5. oszlop, index 4)
+  // Üres vagy érvénytelen dátumú sorok a lista végére kerülnek
+  combined.sort(function(a, b) {
+    var dateA = new Date(a[4]);
+    var dateB = new Date(b[4]);
+    var validA = !isNaN(dateA.getTime());
+    var validB = !isNaN(dateB.getTime());
+    if (!validA && !validB) return 0;
+    if (!validA) return 1;
+    if (!validB) return -1;
+    return dateB - dateA; // csökkenő sorrend: legfrissebb elöl
+  });
+
+  // Szükség esetén sorok hozzáadása
+  var neededRows = combined.length + 1;
+  if (sheet.getMaxRows() < neededRows) {
+    sheet.insertRowsAfter(sheet.getMaxRows(), neededRows - sheet.getMaxRows());
+  }
+
+  // Teljes adatterület újraírása
+  sheet.getRange(2, 1, combined.length, columnCount).setValues(combined);
+  sheet.getRange(2, 1, combined.length, 1).setNumberFormat('@STRING@');
+  Logger.log(newRows.length + " új sor hozzáadva, teljes lista dátum szerint rendezve (" + combined.length + " sor).");
+}
+
+//************************//
+// Sikeres rendelések
+//************************//
+
+function syncSuccessfulOrders() {
+  try {
+    Logger.log("Sikeres rendelések szinkronizálás kezdődik...");
+
+    var ids = getSpreadsheetIds();
+    var sourceSpreadsheet = SpreadsheetApp.openById(ids.sourceSpreadsheetId);
+    var targetSpreadsheet = SpreadsheetApp.openById(ids.targetSpreadsheetId);
+
+    // Sikeres rendelések: L=dátum(12), M=termék(13)
+    var sourceSheetPrefix = "Sikeres rendelések_";
+    var sourceSheet = getSheetByPrefix(sourceSpreadsheet, sourceSheetPrefix);
+    if (!sourceSheet) {
+      Logger.log("Nem található forrás munkalap: " + sourceSheetPrefix);
+      return;
+    }
+
+    var targetSheetName = "Sikeres rendelések";
+    var targetSheet = ensureSheetExists(targetSpreadsheet, targetSheetName);
+
+    var idColumn     = 1;
+    var nameColumn   = 2;
+    var emailColumn  = 9;
+    var phoneColumn  = 10;
+    var dateColumn   = 12;  // L oszlop
+    var productColumn = 13; // M oszlop
+    var bumpColumn   = 15;
+    var bumpQtyColumn = 16;
+    var totalColumn  = 17;
+
+    var headers = ["Azonosító", "Név", "E-mail", "Telefonszám", "Dátum", "Végösszeg", "Termék", "BUMP", "Státusz", "Jutalék"];
+    var statusOptions = ["Válassz", "Időpont küldve", "Időpont emlékeztető", "Foglalt", "Megmentve", "Elvesztett"];
+    var columnCount = headers.length;
+
+    if (targetSheet.getLastRow() === 0) {
+      targetSheet.getRange(1, 1, 1, columnCount).setValues([headers]);
+      targetSheet.getRange(1, 1, targetSheet.getMaxRows(), 1).setNumberFormat('@STRING@');
+    }
+
+    var existingData = targetSheet.getLastRow() > 1
+      ? targetSheet.getRange(2, 1, targetSheet.getLastRow() - 1, 1).getValues()
+      : [];
+    var existingIds = new Set(existingData.map(row => row[0].toString().trim()));
+
+    var sourceData = sourceSheet.getDataRange().getValues();
+    var newRows = [];
+
+    sourceData.forEach((row, idx) => {
+      if (idx === 0) return;
+      var id = row[idColumn - 1].toString().trim();
+      if (!id || existingIds.has(id)) return;
+
+      var bumpQty = parseInt(row[bumpQtyColumn - 1], 10) || 0;
+      var bumpValue = bumpQty > 0 ? row[bumpColumn - 1] || "-" : "-";
+
+      newRows.push([
+        id,
+        row[nameColumn - 1] || "-",
+        row[emailColumn - 1] || "-",
+        row[phoneColumn - 1] || "-",
+        row[dateColumn - 1] || "-",
+        row[totalColumn - 1] || "-",
+        row[productColumn - 1] || "-",
+        bumpValue,
+        "Válassz",
+        ""
+      ]);
+      existingIds.add(id);
+    });
+
+    Logger.log("Új sikeres rendelések száma: " + newRows.length);
+    prependNewData(newRows, targetSheet, columnCount);
+
+    if (targetSheet.getLastRow() > 1) {
+      var statusRange = targetSheet.getRange(2, headers.indexOf("Státusz") + 1, targetSheet.getLastRow() - 1);
+      var rule = SpreadsheetApp.newDataValidation().requireValueInList(statusOptions).setAllowInvalid(false).build();
+      statusRange.setDataValidation(rule);
+    }
+
+    Logger.log("Sikeres rendelések szinkronizálása kész.");
+  } catch (error) {
+    Logger.log("Hiba a syncSuccessfulOrders-ban: " + error.message);
+    throw error;
+  }
+}
+
+//************************//
+// Lejárt előfizetések
+//************************//
+
+function syncExpiredSubscriptions() {
+  try {
+    var ids = getSpreadsheetIds();
+    var sourceSpreadsheet = SpreadsheetApp.openById(ids.sourceSpreadsheetId);
+    var targetSpreadsheet = SpreadsheetApp.openById(ids.targetSpreadsheetId);
+
+    var sourceSheetPrefix = "Lejárt előfizetések_";
+    var targetSheetName = "Lejárt előfizetések";
+
+    // Lejárt előfizetések: M=dátum(13), N=termék(14)
+    var idColumn = 1;
+    var nameColumn = 4;
+    var emailColumn = 11;
+    var phoneColumn = 12;
+    var dateColumn = 13;   // M oszlop
+    var productColumn = 14; // N oszlop
+    var bumpColumn = 16;
+    var bumpQtyColumn = 17;
+    var totalColumn = 19;
+
+    var headers = ["Azonosító", "Név", "E-mail", "Telefonszám", "Dátum", "Végösszeg", "Termék", "BUMP", "Státusz", "Jutalék"];
+    var statusOptions = ["Válassz", "Időpont küldve", "Időpont emlékeztető", "Foglalt", "Megmentve", "Elvesztett"];
+    var columnCount = headers.length;
+
+    var sourceSheet = getSheetByPrefix(sourceSpreadsheet, sourceSheetPrefix);
+    if (!sourceSheet) {
+      Logger.log("Nem található forrás munkalap: " + sourceSheetPrefix);
+      return;
+    }
+
+    var targetSheet = ensureSheetExists(targetSpreadsheet, targetSheetName);
+
+    // Fejléc beállítása ha üres
+    if (targetSheet.getLastRow() === 0) {
+      targetSheet.getRange(1, 1, 1, columnCount).setValues([headers]);
+      targetSheet.getRange(1, 1, targetSheet.getMaxRows(), 1).setNumberFormat('@STRING@');
+    }
+
+    // Meglévő azonosítók
+    var existingData = targetSheet.getLastRow() > 1
+      ? targetSheet.getRange(2, 1, targetSheet.getLastRow() - 1, 1).getValues()
+      : [];
+    var existingIds = new Set(existingData.map(row => row[0].toString().trim()));
+
+    var sourceData = sourceSheet.getDataRange().getValues();
+    var newRows = [];
+
+    sourceData.forEach((row, idx) => {
+      if (idx === 0) return;
+      var id = row[idColumn - 1].toString().trim();
+      if (existingIds.has(id)) return;
+
+      var bumpQty = parseInt(row[bumpQtyColumn - 1], 10) || 0;
+      var bumpValue = bumpQty > 0 ? row[bumpColumn - 1] || "-" : "-";
+
+      newRows.push([
+        id,
+        row[nameColumn - 1] || "-",
+        row[emailColumn - 1] || "-",
+        row[phoneColumn - 1] || "-",
+        row[dateColumn - 1] || "-",
+        row[totalColumn - 1] || "-",
+        row[productColumn - 1] || "-",
+        bumpValue,
+        "Válassz",
+        ""
+      ]);
+      existingIds.add(id);
+    });
+
+    // Legújabb sorok elöl
+    prependNewData(newRows, targetSheet, columnCount);
+
+    // Státusz legördülő lista
+    if (targetSheet.getLastRow() > 1) {
+      var statusRange = targetSheet.getRange(2, headers.indexOf("Státusz") + 1, targetSheet.getLastRow() - 1);
+      var rule = SpreadsheetApp.newDataValidation().requireValueInList(statusOptions).setAllowInvalid(false).build();
+      statusRange.setDataValidation(rule);
+    }
+
+    Logger.log("Lejárt előfizetések szinkronizálása kész.");
+  } catch (error) {
+    Logger.log("Hiba a syncExpiredSubscriptions-ban: " + error.message);
+    throw error;
+  }
+}
+
+//************************//
+// Törölt előfizetések
+//************************//
+
+function syncCanceledSubscriptions() {
+  try {
+    Logger.log("Törölt előfizetések szinkronizálás kezdődik...");
+
+    var ids = getSpreadsheetIds();
+    var sourceSpreadsheet = SpreadsheetApp.openById(ids.sourceSpreadsheetId);
+    var targetSpreadsheet = SpreadsheetApp.openById(ids.targetSpreadsheetId);
+
+    // JAVÍTVA: prefix alapú keresés, nem pontos dátumra – konzisztens a többi függvénnyel
+    var sourceSheetPrefix = "Törölt előfizetések_";
+    var sourceSheet = getSheetByPrefix(sourceSpreadsheet, sourceSheetPrefix);
+    if (!sourceSheet) {
+      Logger.log("Nem található forrás munkalap az előtag alapján: " + sourceSheetPrefix);
+      return;
+    }
+
+    var targetSheetName = "Törölt előfizetések";
+    // JAVÍTVA: ensureSheetExists nem törli az adatokat, adatvesztés megszüntetve
+    var targetSheet = ensureSheetExists(targetSpreadsheet, targetSheetName);
+
+    // Törölt előfizetések: M=dátum(13), N=termék(14)
+    var idColumn = 1;
+    var nameColumn = 4;
+    var emailColumn = 11;
+    var phoneColumn = 12;
+    var dateColumn = 13;   // M oszlop
+    var productColumn = 14; // N oszlop
+    var bumpColumn = 16;
+    var bumpQtyColumn = 17;
+    var totalColumn = 19;
+
+    var headers = ["Azonosító", "Név", "E-mail", "Telefonszám", "Dátum", "Végösszeg", "Termék", "BUMP", "Státusz", "Jutalék"];
+    var statusOptions = ["Válassz", "Időpont küldve", "Időpont emlékeztető", "Foglalt", "Megmentve", "Elvesztett"];
+    var columnCount = headers.length;
+
+    if (targetSheet.getLastRow() === 0) {
+      targetSheet.getRange(1, 1, 1, columnCount).setValues([headers]);
+      targetSheet.getRange(1, 1, targetSheet.getMaxRows(), 1).setNumberFormat('@STRING@');
+    }
+
+    var existingData = targetSheet.getLastRow() > 1
+      ? targetSheet.getRange(2, 1, targetSheet.getLastRow() - 1, 1).getValues()
+      : [];
+    var existingIds = new Set(existingData.map(row => row[0].toString().trim()));
+
+    var sourceData = sourceSheet.getDataRange().getValues();
+    var newRows = [];
+
+    sourceData.forEach((row, idx) => {
+      if (idx === 0) return;
+      var id = row[idColumn - 1].toString().trim();
+      if (existingIds.has(id)) return;
+
+      var bumpQty = parseInt(row[bumpQtyColumn - 1], 10) || 0;
+      var bumpValue = bumpQty > 0 ? row[bumpColumn - 1] || "-" : "-";
+
+      newRows.push([
+        id,
+        row[nameColumn - 1] || "-",
+        row[emailColumn - 1] || "-",
+        row[phoneColumn - 1] || "-",
+        row[dateColumn - 1] || "-",
+        row[totalColumn - 1] || "-",
+        row[productColumn - 1] || "-",
+        bumpValue,
+        "Válassz",
+        ""
+      ]);
+      existingIds.add(id);
+    });
+
+    prependNewData(newRows, targetSheet, columnCount);
+
+    if (targetSheet.getLastRow() > 1) {
+      var statusRange = targetSheet.getRange(2, headers.indexOf("Státusz") + 1, targetSheet.getLastRow() - 1);
+      var rule = SpreadsheetApp.newDataValidation().requireValueInList(statusOptions).setAllowInvalid(false).build();
+      statusRange.setDataValidation(rule);
+    }
+
+    Logger.log("Törölt előfizetések szinkronizálása kész.");
+  } catch (error) {
+    Logger.log("Hiba a syncCanceledSubscriptions-ban: " + error.message);
+    throw error;
+  }
+}
+
+//************************//
+// Sikertelen rendelések (60 nap)
+//************************//
+
+function syncFailedOrders() {
+  try {
+    Logger.log("Sikertelen rendelések szinkronizálás kezdődik...");
+
+    var ids = getSpreadsheetIds();
+    var sourceSpreadsheet = SpreadsheetApp.openById(ids.sourceSpreadsheetId);
+    var targetSpreadsheet = SpreadsheetApp.openById(ids.targetSpreadsheetId);
+
+    // JAVÍTVA: prefix alapú keresés a konzisztencia miatt
+    var sourceSheetPrefix = "Sikertelen rendelések_";
+    var sourceSheet = getSheetByPrefix(sourceSpreadsheet, sourceSheetPrefix);
+    if (!sourceSheet) {
+      Logger.log("Nem található forrás munkalap: " + sourceSheetPrefix);
+      return;
+    }
+
+    var targetSheetName = "Sikertelen rendelések";
+    var targetSheet = ensureSheetExists(targetSpreadsheet, targetSheetName);
+
+    // Sikertelen rendelések: K=dátum(11), L=termék(12)
+    var idColumn = 1;
+    var nameColumn = 2;
+    var emailColumn = 9;
+    var phoneColumn = 10;
+    var dateColumn = 11;   // K oszlop
+    var productColumn = 12; // L oszlop
+    var bumpColumn = 14;
+    var bumpQtyColumn = 15;
+    var totalColumn = 17;
+
+    var headers = ["Azonosító", "Név", "E-mail", "Telefonszám", "Dátum", "Végösszeg", "Termék", "BUMP", "Státusz", "Jutalék"];
+    var statusOptions = ["Válassz", "Időpont küldve", "Időpont emlékeztető", "Foglalt", "Megmentve", "Elvesztett"];
+    var columnCount = headers.length;
+
+    if (targetSheet.getLastRow() === 0) {
+      targetSheet.getRange(1, 1, 1, columnCount).setValues([headers]);
+      targetSheet.getRange(1, 1, targetSheet.getMaxRows(), 1).setNumberFormat('@STRING@');
+    }
+
+    var existingData = targetSheet.getLastRow() > 1
+      ? targetSheet.getRange(2, 1, targetSheet.getLastRow() - 1, 1).getValues()
+      : [];
+    var existingIds = new Set(existingData.map(row => row[0].toString().trim()));
+
+    var sourceData = sourceSheet.getDataRange().getValues();
+    var newRows = [];
+
+    var sixtyDaysAgo = new Date();
+    sixtyDaysAgo.setDate(sixtyDaysAgo.getDate() - 60);
+    sixtyDaysAgo.setHours(0, 0, 0, 0);
+
+    sourceData.forEach((row, idx) => {
+      if (idx === 0) return;
+
+      var dateStr = row[dateColumn - 1];
+      var date = new Date(dateStr);
+      if (isNaN(date) || date < sixtyDaysAgo) return;
+
+      var id = row[idColumn - 1].toString().trim();
+      if (existingIds.has(id)) return;
+
+      var bumpQty = parseInt(row[bumpQtyColumn - 1], 10) || 0;
+      var bumpValue = bumpQty > 0 ? row[bumpColumn - 1] || "-" : "-";
+
+      newRows.push([
+        id,
+        row[nameColumn - 1] || "-",
+        row[emailColumn - 1] || "-",
+        row[phoneColumn - 1] || "-",
+        dateStr,
+        row[totalColumn - 1] || "-",
+        row[productColumn - 1] || "-",
+        bumpValue,
+        "Válassz",
+        ""
+      ]);
+      existingIds.add(id);
+    });
+
+    Logger.log("Feldolgozott új sorok: " + newRows.length);
+    prependNewData(newRows, targetSheet, columnCount);
+
+    if (targetSheet.getLastRow() > 1) {
+      var statusRange = targetSheet.getRange(2, headers.indexOf("Státusz") + 1, targetSheet.getLastRow() - 1);
+      var rule = SpreadsheetApp.newDataValidation().requireValueInList(statusOptions).setAllowInvalid(false).build();
+      statusRange.setDataValidation(rule);
+    }
+
+    Logger.log("Sikertelen rendelések szinkronizálása kész.");
+  } catch (error) {
+    Logger.log("Hiba a syncFailedOrders-ban: " + error.message);
+    throw error;
+  }
+}
+
+//************************//
+// Upsell (60 nap + termékszűrő)
+//************************//
+
+function syncProductsToUpsell() {
+  try {
+    Logger.log("Termék upsell szinkronizálás kezdődik...");
+
+    var ids = getSpreadsheetIds();
+    var sourceSpreadsheet = SpreadsheetApp.openById(ids.sourceSpreadsheetId);
+    var targetSpreadsheet = SpreadsheetApp.openById(ids.targetSpreadsheetId);
+
+    var sourceSheetPrefix = "Sikeres rendelések_";
+    var sourceSheet = getSheetByPrefix(sourceSpreadsheet, sourceSheetPrefix);
+    if (!sourceSheet) {
+      Logger.log("Nem található forrás munkalap: " + sourceSheetPrefix);
+      return;
+    }
+
+    var sourceData = sourceSheet.getDataRange().getValues();
+
+    // Oszlopindexek a Sikeres rendelések laphoz (fejléc alapján, fallback: fix szám)
+    var sourceHeader = sourceData[0];
+    var productColumnIdx = sourceHeader.indexOf("Termék");
+    if (productColumnIdx === -1) productColumnIdx = 12; // fallback: M oszlop (0-alapú: 12)
+    var dateColumnIdx = sourceHeader.indexOf("Dátum");
+    if (dateColumnIdx === -1) dateColumnIdx = 11;        // fallback: L oszlop (0-alapú: 11)
+    var totalColumnIdx = sourceHeader.indexOf("Végösszeg");
+    if (totalColumnIdx === -1) totalColumnIdx = 16;      // fallback: Q oszlop (0-alapú: 16)
+    Logger.log("Termék oszlop (0-alapú): " + productColumnIdx + " | Dátum: " + dateColumnIdx);
+
+    // 1. Termékek és darabszámok összegyűjtése MINDEN forrás munkalapból
+    // Munkalapok és a hozzájuk tartozó termékoszlop (0-alapú index)
+    var sheetConfigs = [
+      { prefix: "Sikeres rendelések_",      productIdx: 12 }, // M oszlop
+      { prefix: "Sikeres előfizetések_",    productIdx: 13 }, // N oszlop
+      { prefix: "Sikertelen rendelések_",   productIdx: 11 }, // L oszlop
+      { prefix: "Lejárt előfizetések_",     productIdx: 13 }, // N oszlop
+      { prefix: "Törölt előfizetések_",     productIdx: 13 }  // N oszlop
+    ];
+
+    var productCountMap = {}; // { "Terméknév": darabszám }
+
+    sheetConfigs.forEach(function(cfg) {
+      var sheet = getSheetByPrefix(sourceSpreadsheet, cfg.prefix);
+      if (!sheet) {
+        Logger.log("Nem található: " + cfg.prefix);
+        return;
+      }
+      var data = sheet.getDataRange().getValues();
+      data.slice(1).forEach(function(row) {
+        var rawProduct = row[cfg.productIdx];
+        if (rawProduct instanceof Date) return;
+        var product = rawProduct.toString().trim();
+        if (!product || product.includes("GMT")) return;
+        productCountMap[product] = (productCountMap[product] || 0) + 1;
+      });
+      Logger.log(cfg.prefix + " feldolgozva, termékek eddig: " + Object.keys(productCountMap).length);
+    });
+
+    var products = Object.keys(productCountMap);
+    Logger.log("Összesített egyedi termékek száma: " + products.length);
+
+    // 2. Szűrőtábla kezelése
+    var filterSheetName = "Termék_szűrő";
+    var filterSheet = ensureSheetExists(targetSpreadsheet, filterSheetName);
+
+    // Fejléc ellenőrzése – migráció régi formátumokról az új Termék | Db | Kiválasztva formára
+    var currentHeader = filterSheet.getLastRow() > 0
+      ? filterSheet.getRange(1, 1, 1, filterSheet.getLastColumn()).getValues()[0]
+      : [];
+    var isCorrectFormat = currentHeader.length === 3 && currentHeader[1] === "Db";
+
+    if (!isCorrectFormat && filterSheet.getLastRow() > 1) {
+      // Régi formátum: kimentjük a termékneveket és checkbox értékeket, majd újraépítjük
+      Logger.log("Régi szűrőlap formátum, újraépítés...");
+      var oldColCount = currentHeader.length;
+      var oldData = filterSheet.getRange(2, 1, filterSheet.getLastRow() - 1, oldColCount).getValues();
+      // Checkbox az utolsó oszlopban volt (2. vagy 3.)
+      var oldCheckboxIdx = oldColCount - 1;
+      filterSheet.clearContents();
+      filterSheet.getRange(1, 1, 1, 3).setValues([["Termék", "Db", "Kiválasztva"]]);
+      var migratedData = oldData.map(row => [
+        row[0].toString().trim(),
+        productCountMap[row[0].toString().trim()] || 0,
+        row[oldCheckboxIdx] === true
+      ]);
+      if (migratedData.length > 0) {
+        filterSheet.getRange(2, 1, migratedData.length, 3).setValues(migratedData);
+        filterSheet.getRange(2, 3, migratedData.length, 1).insertCheckboxes();
+      }
+      Logger.log("Migráció kész.");
+    }
+
+    if (filterSheet.getLastRow() <= 1) {
+      // Teljesen üres lap – alapból felépítjük
+      filterSheet.getRange(1, 1, 1, 3).setValues([["Termék", "Db", "Kiválasztva"]]);
+      var filterData = products.map(p => [p, productCountMap[p] || 0, false]);
+      if (filterData.length > 0) {
+        filterSheet.getRange(2, 1, filterData.length, 3).setValues(filterData);
+        filterSheet.getRange(2, 3, filterData.length, 1).insertCheckboxes();
+      }
+    } else {
+      // Meglévő lap frissítése: darabszámok update + új termékek hozzáadása
+      var dataRowCount = filterSheet.getLastRow() - 1;
+      var existingFilters = filterSheet.getRange(2, 1, dataRowCount, 3).getValues();
+      var existingProductNames = existingFilters.map(row => row[0].toString().trim());
+
+      // Darabszámok frissítése minden meglévő sornál
+      existingFilters.forEach((row, i) => {
+        var product = row[0].toString().trim();
+        filterSheet.getRange(i + 2, 2).setValue(productCountMap[product] || 0);
+      });
+
+      // Új termékek hozzáadása alulra
+      var newProducts = products.filter(p => !existingProductNames.includes(p));
+      if (newProducts.length > 0) {
+        var lastRow = filterSheet.getLastRow();
+        var newFilterData = newProducts.map(p => [p, productCountMap[p] || 0, false]);
+        filterSheet.getRange(lastRow + 1, 1, newFilterData.length, 3).setValues(newFilterData);
+        filterSheet.getRange(lastRow + 1, 3, newFilterData.length, 1).insertCheckboxes();
+        Logger.log(newProducts.length + " új termék hozzáadva a szűrőlaphoz.");
+      }
+    }
+
+    // 3. Kiválasztott termékek beolvasása (checkbox a 3. oszlopban)
+    var filterData = filterSheet.getRange(2, 1, filterSheet.getLastRow() - 1, 3).getValues();
+    var selectedProducts = filterData
+      .filter(row => row[2] === true)
+      .map(row => row[0].toString().trim());
+
+    // 4. Upsell munkalap kezelése
+    var upsellSheetName = "Upsell";
+    var upsellSheet = ensureSheetExists(targetSpreadsheet, upsellSheetName);
+    var statusOptions = ["Válassz", "Időpont küldve", "Időpont emlékeztető", "Foglalt", "Megmentve", "Elvesztett"];
+    var upsellHeaders = ["Azonosító", "Név", "E-mail", "Telefonszám", "Dátum", "Végösszeg", "Termék", "BUMP", "Státusz", "Jutalék"];
+    var columnCount = upsellHeaders.length;
+
+    if (upsellSheet.getLastRow() === 0) {
+      upsellSheet.getRange(1, 1, 1, columnCount).setValues([upsellHeaders]);
+      upsellSheet.getRange(1, 1, upsellSheet.getMaxRows(), 1).setNumberFormat('@STRING@');
+    }
+
+    var sixtyDaysAgo = new Date();
+    sixtyDaysAgo.setDate(sixtyDaysAgo.getDate() - 60);
+    sixtyDaysAgo.setHours(0, 0, 0, 0);
+
+    if (selectedProducts.length > 0) {
+      var existingData = upsellSheet.getLastRow() > 1
+        ? upsellSheet.getRange(2, 1, upsellSheet.getLastRow() - 1, 1).getValues()
+        : [];
+      var existingIds = new Set(existingData.map(row => row[0].toString().trim()));
+
+      // Fejléc alapú oszlopindexek – biztonságos, nem függ fix számtól
+      var srcIdIdx      = 0;
+      var srcNameIdx    = sourceHeader.indexOf("Név") !== -1 ? sourceHeader.indexOf("Név") : 1;
+      var srcEmailIdx   = sourceHeader.indexOf("Email") !== -1 ? sourceHeader.indexOf("Email")
+                        : sourceHeader.indexOf("E-mail") !== -1 ? sourceHeader.indexOf("E-mail") : 8;
+      var srcPhoneIdx   = sourceHeader.indexOf("Telefon") !== -1 ? sourceHeader.indexOf("Telefon") : 9;
+      var srcDateIdx    = dateColumnIdx; // L oszlop (index 11) a sikeres rendeléseknél
+      var srcBumpIdx    = sourceHeader.indexOf("BUMP") !== -1 ? sourceHeader.indexOf("BUMP") : 13;
+
+      var newRows = sourceData.slice(1)
+        .filter(row => {
+          var date = new Date(row[srcDateIdx]);
+          var productVal = row[productColumnIdx];
+          if (productVal instanceof Date) return false;
+          var productName = productVal.toString().trim();
+          return selectedProducts.includes(productName) &&
+                 !isNaN(date) && date >= sixtyDaysAgo;
+        })
+        .map(row => [
+          row[srcIdIdx].toString().trim(),
+          row[srcNameIdx] || "-",
+          row[srcEmailIdx] || "-",
+          row[srcPhoneIdx] || "-",
+          row[srcDateIdx] || "-",
+          row[totalColumnIdx] || "-",
+          row[productColumnIdx] || "-",
+          row[srcBumpIdx] || "-",
+          "Válassz",
+          ""
+        ])
+        .filter(row => !existingIds.has(row[0]));
+
+      prependNewData(newRows, upsellSheet, columnCount);
+
+      if (upsellSheet.getLastRow() > 1) {
+        var statusColumn = upsellHeaders.indexOf("Státusz") + 1;
+        var statusRange = upsellSheet.getRange(2, statusColumn, upsellSheet.getLastRow() - 1);
+        var rule = SpreadsheetApp.newDataValidation().requireValueInList(statusOptions).setAllowInvalid(false).build();
+        statusRange.setDataValidation(rule);
+      }
+
+      Logger.log(newRows.length + " új sor hozzáadva az Upsell táblához.");
+    }
+
+    Logger.log("Termék upsell szinkronizálás kész.");
+  } catch (error) {
+    Logger.log("Hiba a syncProductsToUpsell-ban: " + error.message);
+    throw error;
+  }
+}
+
+//************************//
+// Nem saját feladatok törlése
+//************************//
+
+function cleanTargetSpreadsheet() {
+  try {
+    Logger.log("=== Cél táblázat tisztítása ===");
+
+    var ids = getSpreadsheetIds();
+    var sourceSpreadsheet = SpreadsheetApp.openById(ids.sourceSpreadsheetId);
+    var targetSpreadsheet = SpreadsheetApp.openById(ids.targetSpreadsheetId);
+    var targetSpreadsheetUrl = targetSpreadsheet.getUrl();
+
+    var ownerColumnIndex = 26;
+    var idColumnIndex = 1;
+
+    // Forrásból összegyűjtjük az "idegen" azonosítókat
+    var sourceInvalidIds = new Set();
+    sourceSpreadsheet.getSheets().forEach(sheet => {
+      var data = sheet.getDataRange().getValues();
+      data.forEach((row, rowIndex) => {
+        if (rowIndex === 0) return;
+        var ownerUrl = row[ownerColumnIndex - 1];
+        if (ownerUrl && ownerUrl.toString().trim() !== "" && ownerUrl.toString().trim() !== targetSpreadsheetUrl) {
+          sourceInvalidIds.add(row[idColumnIndex - 1]);
+        }
+      });
+    });
+
+    Logger.log("Idegen tulajdonosú azonosítók száma: " + sourceInvalidIds.size);
+
+    // Cél táblázatban törlendő sorok összegyűjtése
+    var invalidRows = [];
+    targetSpreadsheet.getSheets().forEach(sheet => {
+      var data = sheet.getDataRange().getValues();
+      data.forEach((row, rowIndex) => {
+        if (rowIndex === 0) return;
+        if (sourceInvalidIds.has(row[idColumnIndex - 1])) {
+          invalidRows.push({ sheetName: sheet.getName(), rowIndex: rowIndex + 1 });
+        }
+      });
+    });
+
+    // Törlés hátulról előre (hogy az indexek ne csússzanak el)
+    invalidRows.reverse().forEach(invalidRow => {
+      var sheet = targetSpreadsheet.getSheetByName(invalidRow.sheetName);
+      if (sheet) {
+        sheet.deleteRow(invalidRow.rowIndex);
+      }
+    });
+
+    Logger.log("Törölt sorok száma: " + invalidRows.length);
+    Logger.log("=== Cél táblázat tisztítása kész ===");
+  } catch (error) {
+    Logger.log("Hiba a cleanTargetSpreadsheet-ban: " + error.message);
+    throw error;
+  }
+}
+
+//************************//
+// Státusz szerkesztés figyelése
+//************************//
+
+function onEditInstallable(e) {
+  try {
+    if (e.range.getColumn() !== 9 || e.range.getRow() <= 1) return;
+
+    var sheet = e.source.getActiveSheet();
+    var status = e.range.getValue();
+    var currentId = sheet.getRange(e.range.getRow(), 1).getValue().toString().trim();
+
+    Logger.log("Módosított sor: " + e.range.getRow() + " | Státusz: " + status + " | Azonosító: " + currentId);
+
+    if (!currentId) {
+      Logger.log("Hiba: Nincs azonosító a sorban.");
+      return;
+    }
+
+    // Sor kiszínezése
+    var color = getStatusColor(status);
+    sheet.getRange(e.range.getRow(), 1, 1, sheet.getLastColumn()).setBackground(color);
+
+    // JAVÍTVA: Jutalékszámítás – csak egy deklaráció, cél táblából olvas
+    var totalColumn = 6;
+    var commissionColumn = 10;
+    var totalCell = sheet.getRange(e.range.getRow(), totalColumn);
+    var totalValue = parseFloat(totalCell.getValue().toString().replace(/[^0-9.]/g, ""));
+    var commissionCell = sheet.getRange(e.range.getRow(), commissionColumn);
+
+    if (status === "Megmentve") {
+      var commissionType = getCommissionType();
+      if (commissionType === "fixed") {
+        commissionCell.setValue(getCommissionAmount());
+      } else if (commissionType === "percentage") {
+        if (!isNaN(totalValue) && totalValue > 0) {
+          commissionCell.setValue((totalValue * getCommissionRate()) / 100);
+        } else {
+          commissionCell.setValue("");
+        }
+      }
+      commissionCell.setNumberFormat("#,##0 Ft");
+    } else {
+      commissionCell.setValue("");
+    }
+
+    // Forrás táblázat frissítése (Tulajdonos oszlop – 26.)
+    var ids = getSpreadsheetIds();
+    var sourceSpreadsheet = SpreadsheetApp.openById(ids.sourceSpreadsheetId);
+    var sheets = sourceSpreadsheet.getSheets();
+    var callingSpreadsheetUrl = e.source.getUrl();
+
+    var found = false;
+    var sourceSheet = null;
+    var sourceRow = -1;
+
+    // Először a névhez illő forráslapon keresünk
+    var targetSheetName = sheet.getName();
+    var regex = new RegExp(targetSheetName + "_.*", "i");
+
+    for (var i = 0; i < sheets.length && !found; i++) {
+      if (regex.test(sheets[i].getName())) {
+        var sheetData = sheets[i].getDataRange().getValues();
+        for (var j = 0; j < sheetData.length; j++) {
+          if (sheetData[j][0].toString().trim() === currentId) {
+            sourceRow = j + 1;
+            sourceSheet = sheets[i];
+            found = true;
+            break;
+          }
+        }
+      }
+    }
+
+    // Ha nem találtuk, az összes lapon keresünk
+    if (!found) {
+      for (var i = 0; i < sheets.length && !found; i++) {
+        var sheetData = sheets[i].getDataRange().getValues();
+        for (var j = 0; j < sheetData.length; j++) {
+          if (sheetData[j][0].toString().trim() === currentId) {
+            sourceRow = j + 1;
+            sourceSheet = sheets[i];
+            found = true;
+            break;
+          }
+        }
+      }
+    }
+
+    if (found && sourceRow > 0 && sourceSheet) {
+      if (status === "Válassz") {
+        sourceSheet.getRange(sourceRow, 26).clearContent();
+        Logger.log("Tulajdonos törölve: " + currentId);
+      } else {
+        sourceSheet.getRange(sourceRow, 26).setValue(callingSpreadsheetUrl);
+        Logger.log("Tulajdonos beállítva: " + currentId);
+      }
+    } else {
+      Logger.log("Azonosító nem található a forrásban: " + currentId);
+    }
+
+    // Idegen sorok törlése
+    cleanTargetSpreadsheet();
+
+  } catch (error) {
+    Logger.log("Hiba az onEditInstallable-ban: " + error.toString());
+  }
+}
+
+// Státusz színek
+function getStatusColor(status) {
+  switch (status) {
+    case "Időpont küldve":      return "#FFFF00";
+    case "Időpont emlékeztető": return "#FFA500";
+    case "Foglalt":             return "#ADD8E6";
+    case "Megmentve":           return "#90EE90";
+    case "Elvesztett":          return "#FF6347";
+    default:                    return "#FFFFFF";
+  }
+}
