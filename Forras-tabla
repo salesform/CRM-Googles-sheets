@@ -1,0 +1,319 @@
+function processCSVsWithSubscriptionLogic() {
+  var config = {
+    orders: [
+      "https://bartfaibalazs.salesform.hu/index/csv?key=927b4b0fbe1b55081a80c9676a1f50f6",
+      "https://sf.salesform.hu/index/csv?key=121482f1b93ab76d91d4f60cdf387262",
+      "https://f.salesform.hu/index/csv?key=6f3afdf5123ef7165166d8aae531f016",
+      "https://sf.tikybui.hu/index/csv?key=eaf37df0568d8018ca92bc3827d5e4b1"
+    ],
+    subscriptions: [
+      "https://bartfaibalazs.salesform.hu/index/csv?rec&key=927b4b0fbe1b55081a80c9676a1f50f6",
+      "https://sf.salesform.hu/index/csv?rec&key=121482f1b93ab76d91d4f60cdf387262",
+      "https://f.salesform.hu/index/csv?rec&key=6f3afdf5123ef7165166d8aae531f016",
+      "https://sf.tikybui.hu/index/csv?rec&key=eaf37df0568d8018ca92bc3827d5e4b1"
+    ],
+    sheets: {
+      successfulOrders: "Sikeres rendelések",
+      successfulSubscriptions: "Sikeres előfizetések",
+      failed: "Sikertelen rendelések",
+      expired: "Lejárt előfizetések",
+      canceled: "Törölt előfizetések"
+    },
+    chunkSize: 500
+  };
+
+  logInfo("Script végrehajtás kezdete");
+  
+  try {
+    var spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+    logInfo("Aktív munkafüzet neve: " + spreadsheet.getName());
+    
+    var dateSuffix = "_" + getCurrentDate();
+    logInfo("Használt dátum suffix: " + dateSuffix);
+
+    var successfulOrdersSheet = getOrCreateSheet(spreadsheet, config.sheets.successfulOrders, dateSuffix);
+    var successfulSubscriptionsSheet = getOrCreateSheet(spreadsheet, config.sheets.successfulSubscriptions, dateSuffix);
+    var failedSheet = getOrCreateSheet(spreadsheet, config.sheets.failed, dateSuffix);
+    var expiredSheet = getOrCreateSheet(spreadsheet, config.sheets.expired, dateSuffix);
+    var canceledSheet = getOrCreateSheet(spreadsheet, config.sheets.canceled, dateSuffix);
+
+    var today = new Date();
+    logInfo("Rendelések feldolgozásának kezdete");
+    
+    config.orders.forEach(function(url, index) {
+      logInfo(`${index + 1}. rendelési URL feldolgozása: ${url}`);
+      processOrders(url, successfulOrdersSheet, failedSheet, config.chunkSize);
+    });
+
+    logInfo("Előfizetések feldolgozásának kezdete");
+    config.subscriptions.forEach(function(url, index) {
+      logInfo(`${index + 1}. előfizetési URL feldolgozása: ${url}`);
+      processSubscriptions(url, successfulSubscriptionsSheet, expiredSheet, canceledSheet, today, config.chunkSize);
+    });
+
+    logSuccess("CSV-k feldolgozása sikeresen befejeződött");
+  } catch (e) {
+    logError("Kritikus hiba történt", e);
+    SpreadsheetApp.getActiveSpreadsheet().toast("Hiba történt: " + e.message, "Figyelmeztetés", 5);
+  }
+}
+
+function getOrCreateSheet(spreadsheet, baseName, dateSuffix) {
+  var sheets = spreadsheet.getSheets();
+  var currentSheet = null;
+
+  // Keresünk egy lapot, ami a baseName-nel kezdődik
+  for (var i = 0; i < sheets.length; i++) {
+    if (sheets[i].getName().startsWith(baseName)) {
+      currentSheet = sheets[i];
+      break;
+    }
+  }
+
+  if (currentSheet) {
+    var newName = baseName + dateSuffix;
+    if (currentSheet.getName() !== newName) {
+      logInfo("Meglévő munkalap átnevezése: " + currentSheet.getName() + " -> " + newName);
+      currentSheet.setName(newName);
+    } else {
+      logInfo("Meglévő munkalap neve már helyes: " + newName);
+    }
+  } else {
+    var newName = baseName + dateSuffix;
+    logInfo("Új munkalap létrehozása: " + newName);
+    currentSheet = spreadsheet.insertSheet(newName);
+  }
+
+  return currentSheet;
+}
+
+
+function processOrders(url, successfulOrdersSheet, failedSheet, chunkSize) {
+  logInfo("Rendelési adatok letöltése: " + url);
+  
+  var response = UrlFetchApp.fetch(url);
+  if (response.getResponseCode() !== 200) {
+    logError("CSV letöltési hiba", new Error("HTTP " + response.getResponseCode()));
+    throw new Error("Nem sikerült elérni a CSV-t: " + response.getResponseCode());
+  }
+
+  var csvData = Utilities.parseCsv(response.getContentText());
+  logInfo(`CSV adatok beolvasva: ${csvData.length} sor található`);
+
+  if (!csvData || csvData.length === 0) {
+    logError("Üres CSV", new Error("A CSV üres vagy hibás formátumú"));
+    throw new Error("A CSV üres vagy hibás formátumú.");
+  }
+
+  var header = csvData[0];
+  var statusIndex = header.indexOf("Státusz");
+  if (statusIndex === -1) {
+    logError("Hiányzó oszlop", new Error("Státusz oszlop nem található"));
+    throw new Error("'Státusz' oszlop nem található a rendelések CSV-jében.");
+  }
+
+  logInfo("Sikeres rendelések feldolgozása");
+  processFilteredData(csvData, successfulOrdersSheet, statusIndex, "sikeres", chunkSize);
+  
+  logInfo("Sikertelen rendelések feldolgozása");
+  processFilteredData(csvData, failedSheet, statusIndex, "sikertelen", chunkSize);
+}
+
+function processSubscriptions(url, successfulSubscriptionsSheet, expiredSheet, canceledSheet, today, chunkSize) {
+  logInfo("Előfizetési adatok letöltése: " + url);
+  
+  var response = UrlFetchApp.fetch(url);
+  if (response.getResponseCode() !== 200) {
+    logError("CSV letöltési hiba", new Error("HTTP " + response.getResponseCode()));
+    throw new Error("Nem sikerült elérni a CSV-t: " + response.getResponseCode());
+  }
+
+  var csvData = Utilities.parseCsv(response.getContentText());
+  logInfo(`Előfizetési CSV beolvasva: ${csvData.length} sor található`);
+
+  if (!csvData || csvData.length === 0) {
+    logError("Üres CSV", new Error("A CSV üres vagy hibás formátumú"));
+    throw new Error("A CSV üres vagy hibás formátumú.");
+  }
+
+  var header = csvData[0];
+  var statusIndex = header.indexOf("Státusz");
+  var dueDateIndex = header.indexOf("Esedékesség");
+  
+  if (statusIndex === -1 || dueDateIndex === -1) {
+    logError("Hiányzó oszlopok", new Error("Státusz vagy Esedékesség oszlop nem található"));
+    throw new Error("'Státusz' vagy 'Esedékesség' oszlop nem található az előfizetések CSV-jében.");
+  }
+
+  logInfo("Sikeres előfizetések feldolgozása");
+  processFilteredSubscriptionData(csvData, successfulSubscriptionsSheet, function(row) {
+    return row[statusIndex] === "Sikeres" && isValidDate(row[dueDateIndex]);
+  }, chunkSize);
+
+  logInfo("Lejárt előfizetések feldolgozása");
+  processFilteredSubscriptionData(csvData, expiredSheet, function(row) {
+    var dueDate = new Date(row[dueDateIndex]);
+    return isValidDate(row[dueDateIndex]) && dueDate < today;
+  }, chunkSize);
+
+  logInfo("Törölt előfizetések feldolgozása");
+  processFilteredSubscriptionData(csvData, canceledSheet, function(row) {
+    return row[dueDateIndex] === "Lemondott";
+  }, chunkSize);
+}
+
+function processFilteredData(csvData, sheet, statusIndex, status, chunkSize) {
+  logInfo(`Adatok szűrése '${status}' státusz alapján`);
+  
+  var header = ensureHeaderWithOwner(sheet, csvData[0]);
+  var columnCount = header.length;
+  
+  var filteredData = filterNewData(csvData, sheet, function(row) {
+    return row[statusIndex] && row[statusIndex].toLowerCase() === status;
+  }, columnCount);
+  
+  logInfo(`Szűrés eredménye: ${filteredData.length - 1} új sor található`);
+  appendNewData(filteredData, sheet, columnCount);
+}
+
+function processFilteredSubscriptionData(csvData, sheet, filterFunction, chunkSize) {
+  logInfo("Előfizetési adatok szűrése");
+  
+  var header = ensureHeaderWithOwner(sheet, csvData[0]);
+  var columnCount = header.length;
+
+  var filteredData = filterNewData(csvData, sheet, filterFunction, columnCount);
+  logInfo(`Szűrés eredménye: ${filteredData.length - 1} új előfizetés található`);
+  
+  appendNewData(filteredData, sheet, columnCount);
+}
+
+function ensureHeaderWithOwner(sheet, csvHeader) {
+  logInfo("Fejléc ellenőrzése és Tulajdonos oszlop hozzáadása");
+  
+  var currentHeader = [];
+  if (sheet.getLastRow() > 0) {
+    currentHeader = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    logInfo("Meglévő fejléc oszlopainak száma: " + currentHeader.length);
+  }
+
+  if (currentHeader.length === 0) {
+    var newHeader = csvHeader.concat(["Tulajdonos"]);
+    sheet.getRange(1, 1, 1, newHeader.length).setValues([newHeader]);
+    sheet.getRange(2, 1, sheet.getMaxRows(), 1).setNumberFormat('@STRING@'); // Az első oszlop szövegként kezelése
+    logInfo("Új fejléc létrehozva Tulajdonos oszloppal");
+    return newHeader;
+  }
+
+  if (currentHeader[currentHeader.length - 1] !== "Tulajdonos") {
+    var lastCol = sheet.getLastColumn();
+    sheet.getRange(1, lastCol + 1).setValue("Tulajdonos");
+    logInfo("Tulajdonos oszlop hozzáadva a meglévő fejléchez");
+    return currentHeader.concat(["Tulajdonos"]);
+  }
+
+  logInfo("Fejléc már tartalmazza a Tulajdonos oszlopot");
+  return currentHeader;
+}
+
+
+function filterNewData(data, sheet, filterFunction, columnCount) {
+  var existingData = sheet.getLastRow() > 0 ? sheet.getDataRange().getValues() : [];
+  // Azonosítók tárolása szövegként
+  var existingIds = new Set(existingData.slice(1).map(row => String(row[0])));
+  logInfo(`Meglévő azonosítók száma: ${existingIds.size}`);
+  
+  var header = data[0];
+  var filteredData = [];
+  filteredData.push(header);
+
+  for (var i = 1; i < data.length; i++) {
+    var row = data[i];
+    // Azonosító szövegként való kezelése
+    var id = String(row[0]);
+    if (filterFunction(row) && !existingIds.has(id)) {
+      while (row.length < columnCount) {
+        row.push("");
+      }
+      filteredData.push(row);
+    }
+  }
+
+  logInfo(`Szűrés eredménye: ${filteredData.length - 1} új sor`);
+  return filteredData;
+}
+
+
+function appendNewData(data, sheet, columnCount) {
+  if (data.length <= 1) {
+    logInfo("Nincs új adat hozzáadásra");
+    return;
+  }
+
+  var lastRow = sheet.getLastRow();
+  var startRow = lastRow > 0 ? lastRow + 1 : 1;
+
+  // Azonosító oszlop szöveges formátumra állítása
+  sheet.getRange(startRow, 1, data.length - 1, 1).setNumberFormat('@STRING@');
+
+  logInfo(`Új adatok hozzáadása: ${data.length - 1} sor, kezdő sor: ${startRow}`);
+  var range = sheet.getRange(startRow, 1, data.length - 1, columnCount);
+  range.setValues(data.slice(1));
+  logInfo("Adatok sikeresen hozzáadva");
+}
+
+function filterNewData(data, sheet, filterFunction, columnCount) {
+  var existingData = sheet.getLastRow() > 0 ? sheet.getDataRange().getValues() : [];
+  var existingIds = new Set(existingData.slice(1).map(row => String(row[0])));
+
+  logInfo(`Meglévő azonosítók száma: ${existingIds.size}`);
+
+  var header = data[0];
+  var filteredData = [];
+  filteredData.push(header);
+
+  for (var i = 1; i < data.length; i++) {
+    var row = data[i];
+    var id = String(row[0]);
+    if (filterFunction(row) && !existingIds.has(id)) {
+      while (row.length < columnCount) {
+        row.push("");
+      }
+      filteredData.push(row);
+    }
+  }
+
+  logInfo(`Szűrés eredménye: ${filteredData.length - 1} új sor`);
+  return filteredData;
+}
+
+
+
+function getCurrentDate() {
+  var now = new Date();
+  return now.getFullYear() + "-" +
+         String(now.getMonth() + 1).padStart(2, '0') + "-" +
+         String(now.getDate()).padStart(2, '0');
+}
+
+function isValidDate(dateString) {
+  var date = new Date(dateString);
+  return !isNaN(date.getTime());
+}
+
+// Logolási segédfüggvények
+function logInfo(message) {
+  Logger.log(`INFO [${new Date().toISOString()}]: ${message}`);
+}
+
+function logError(message, error) {
+  Logger.log(`ERROR [${new Date().toISOString()}]: ${message}`);
+  if (error) {
+    Logger.log(`Error details: ${error.message}`);
+    Logger.log(`Stack trace: ${error.stack}`);
+  }
+}
+
+function logSuccess(message) {
+  Logger.log(`SUCCESS [${new Date().toISOString()}]: ${message}`);
+}
